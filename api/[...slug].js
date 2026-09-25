@@ -86,7 +86,7 @@ export default async function handler(req) {
     if (provider) {
       body.providerOptions = body.providerOptions || {};
       body.providerOptions.gateway = body.providerOptions.gateway || {};
-      body.providerOptions.gateway.order = [provider];
+      body.providerOptions.gateway.only = [provider];
     }
 
     if (reasoning && reasoning !== 'none' && reasoning !== 'off') {
