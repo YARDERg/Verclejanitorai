@@ -1,0 +1,6 @@
+{
+  "name": "janitorai-vercel-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "description": "بروكسي يوصل JanitorAI بـ Vercel AI Gateway، مع تحديد المزود والـ reasoning عبر الـ URL"
+}
