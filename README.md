@@ -75,7 +75,11 @@ JanitorAI بيتعامل مع أي "Proxy" كأنه سيرفر متوافق مع
 ## تشغيله محليًا على Termux (Android) + cloudflared — بديل مجاني عن Vercel
 
 الملف الجاهز لده في `local-server/server.mjs` (نفس منطق `api/[...slug].js` بالظبط،
-بصيغة سيرفر Node عادي بدون أي مكتبات خارجية).
+بصيغة سيرفر Node عادي بدون أي مكتبات خارجية، وبيسجّل كل طلب في قاعدة بيانات SQLite
+محلية — راجع [تسجيل الطلبات محليًا](#تسجيل-الطلبات-محليًا-قاعدة-البيانات) تحت).
+
+> يحتاج Node **22.5 أو أحدث** عشان `node:sqlite` (لتسجيل الطلبات) تكون متاحة.
+> `pkg install nodejs` على Termux بيجيب أحدث نسخة عادةً، فمفروض تكون متاحة.
 
 ### 1) تثبيت Node.js و cloudflared و git
 
@@ -149,51 +153,62 @@ curl -X POST https://your-project.vercel.app/chat/completions \
   }'
 ```
 
-## تسجيل الطلبات محليًا (اللوج)
+## تسجيل الطلبات محليًا (قاعدة البيانات)
 
 نسخة `local-server` بس (مش نسخة Vercel، لأن دي stateless ومفيهاش تخزين دائم) بتسجّل
-كل طلب في ملف على جهازك، جوه `local-server/logs/`. الملفات من نوع **JSON Lines**
-(سطر = حدث JSON واحد) — ملف منفصل لكل يوم بصيغة `YYYY-MM-DD.ndjson`، عشان تقدر
-تلاقي وتنضف القديم بسهولة.
+كل طلب في **قاعدة بيانات SQLite حقيقية، ملف واحد بس**: `local-server/logs.db`.
 
-كل سطر "request" فيه:
+مبني على `node:sqlite` **المدمجة جوه Node نفسه** (متاحة من Node 22.5+) — يعني مفيش
+أي `npm install`. الملف ده بيتفتح ويضاف عليه في كل مرة تشغّل `node server.mjs`،
+حتى لو قفلت جلسة Termux وفتحتها تاني بعد يوم أو أسبوع — البيانات بتفضل موجودة
+وبيكمّل يضيف عليها من غير ما يعمل ملفات جديدة أو يصفّرها.
+
+فيه جدول واحد اسمه `requests`، وكل سطر فيه:
 
 - التاريخ والوقت (`ts`)، ومدة الطلب (`duration_ms`)
 - `provider`، `model`، `reasoning_effort` (المستخرجين من خانة Model)
-- `input.messages` (كل الرسايل اللي اتبعتت — النص الكامل)
-- `output.content` (رد الموديل الكامل) و`output.finish_reason`
-- `reasoning.text` (نص التفكير الكامل لو الموديل بعت reasoning)
-- `usage` (توكنز الإدخال/الإخراج/التفكير لو Vercel رجّعتهم)
-- `generation_id` بتاع Vercel لكل طلب
+- `input_messages` (كل الرسايل اللي اتبعتت — النص الكامل، JSON)
+- `output_content` (رد الموديل الكامل) و`finish_reason`
+- `reasoning_text` (نص التفكير الكامل لو الموديل بعت reasoning)
+- توكنز الإدخال/الإخراج/التفكير (`usage_prompt_tokens`... إلخ)
+- `generation_id` بتاع Vercel، وعمود `total_cost` (وتفاصيل التكلفة الفرعية)
 
-**التكلفة (`cost`)** بتوصل متأخرة شوية (ثواني معدودة) لأن Vercel بتسجل الـ usage
-events بشكل غير متزامن، فالبروكسي بيحاول يجيبها في الخلفية (من غير ما يأخر الرد
-اللي راجع لـ JanitorAI) وبيضيفها كسطر `"type":"cost"` منفصل مربوط بنفس الـ
-`generation_id`.
+**التكلفة (`total_cost`)** بتوصل متأخرة شوية (ثواني معدودة) لأن Vercel بتسجل الـ
+usage events بشكل غير متزامن، فالبروكسي بيحاول يجيبها في الخلفية (من غير ما يأخر
+الرد اللي راجع لـ JanitorAI) وبيعمل `UPDATE` على نفس السطر لما توصل.
 
-**مهم:** الـ **API key** بتاعك **مابيتسجلش خالص** في اللوج — بس بيتمرر في الهيدر
-ولا بيتحفظ في أي ملف.
+**مهم:** الـ **API key** بتاعك **مابيتسجلش خالص** في قاعدة البيانات — بس بيتمرر في
+الهيدر ولا بيتحفظ في أي مكان.
 
-### عرض اللوج
+### عرض قاعدة البيانات
 
 من جوه `local-server/`:
 
 ```bash
-node view-logs.mjs                 # ملخّص طلبات النهارده
-node view-logs.mjs 2026-09-20      # ملخّص يوم معيّن
-node view-logs.mjs --all           # كل التواريخ المتوفرة
-node view-logs.mjs --stats         # إجمالي التوكنز والتكلفة على كل الأيام
-node view-logs.mjs --full <id>     # التفاصيل الكاملة (input/output/reasoning) لطلب واحد بالـ generation_id بتاعه
+node view-logs.mjs                 # آخر 20 طلب (بغض النظر عن التاريخ)
+node view-logs.mjs --last 50       # آخر 50 طلب
+node view-logs.mjs 2026-09-20      # كل طلبات يوم معيّن
+node view-logs.mjs --all           # كل التواريخ اللي فيها طلبات
+node view-logs.mjs --stats         # إجمالي التوكنز والتكلفة على كل الفترة
+node view-logs.mjs --full <id>     # التفاصيل الكاملة (input/output/reasoning) لطلب واحد — الـ id رقم السطر أو generation_id بتاع Vercel
 ```
 
-لو عايز تمسح اللوجات القديمة، امسح الملفات اللي جوه `local-server/logs/` عادي —
-مفيش أي حاجة بتتحدّث تلقائيًا بترجع تاني.
+أو لو عايز تستعلم بنفسك بـ SQL مباشرة (بعد تثبيت أداة `sqlite3` أو أي برنامج زي
+DB Browser for SQLite):
 
-> **خصوصية:** مجلد `local-server/logs/` مضاف في `.gitignore`، يعني لو الـ repo بتاعك
+```bash
+sqlite3 local-server/logs.db "SELECT ts, model, total_cost FROM requests ORDER BY id DESC LIMIT 5;"
+```
+
+لو عايز تصفّر السجل كله، امسح `local-server/logs.db` (وملفات `logs.db-wal` /
+`logs.db-shm` المرافقة له لو موجودة) — هيتعمل من جديد أول ما تشغّل السيرفر تاني.
+
+> **خصوصية:** `local-server/logs.db` مضاف في `.gitignore`، يعني لو الـ repo بتاعك
 > على GitHub (حتى لو private) مش هيترفع فيه، وهيفضل على جهازك بس.
 
 ## ملاحظات
 
 - CORS مفتوح للجميع (`Access-Control-Allow-Origin: *`) لأن JanitorAI بيستدعي البروكسي
   مباشرة من متصفح المستخدم.
-- الـ streaming (`stream: true`) بيتمرر كما هو (pass-through) من غير أي تعديل.
+- الـ streaming (`stream: true`) بيتمرر لحظيًا للعميل زي ما هو (pass-through حقيقي)،
+  وفي نفس الوقت بيتجمّع في الخلفية عشان يتسجل في قاعدة البيانات بعد ما يخلص.
