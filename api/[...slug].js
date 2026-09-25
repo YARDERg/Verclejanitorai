@@ -22,33 +22,49 @@ function json(data, status = 200) {
   });
 }
 
+/**
+ * يفكّ خانة الـ Model من JanitorAI بصيغة:
+ *   provider/modelname            (بدون reasoning)
+ *   provider/modelname/reasoning  (مع reasoning)
+ *
+ * أمثلة:
+ *   "zai/glm-4.6/high"          -> model: "zai/glm-4.6",          provider: "zai", reasoning: "high"
+ *   "zai/glm-4.6"               -> model: "zai/glm-4.6",          provider: "zai", reasoning: null
+ *   "groq/openai/gpt-oss-120b"  -> model: "groq/openai/gpt-oss-120b", provider: "groq", reasoning: null
+ *   "glm-4.6"                   -> model: "glm-4.6",              provider: null,  reasoning: null
+ */
+function parseModelField(rawModel) {
+  if (typeof rawModel !== 'string' || !rawModel.includes('/')) {
+    return { model: rawModel, provider: null, reasoning: null };
+  }
+
+  const parts = rawModel.split('/');
+  let reasoning = null;
+
+  const last = parts[parts.length - 1].toLowerCase();
+  // نعتبر آخر جزء "reasoning" بس لو كان قيمة معروفة، ولسه فاضل جزءين على الأقل بعد شيله
+  if (parts.length >= 3 && VALID_EFFORTS.has(last)) {
+    reasoning = last;
+    parts.pop();
+  }
+
+  return {
+    model: parts.join('/'),
+    provider: parts[0] || null,
+    reasoning,
+  };
+}
+
 export default async function handler(req) {
   // دعم preflight الخاص بالمتصفح (JanitorAI بيستدعي من المتصفح مباشرة)
   if (req.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: corsHeaders() });
   }
 
-  const url = new URL(req.url);
-  const segments = url.pathname.split('/').filter(Boolean);
-
-  // JanitorAI بيضيف "/chat/completions" تلقائيًا في آخر الـ Proxy URL
-  // فبنشيلها من آخر المسار عشان يفضل بس أجزاء التهيئة (provider/reasoning)
-  const rest = segments.slice();
-  if (rest.length && rest[rest.length - 1] === 'completions') rest.pop();
-  if (rest.length && rest[rest.length - 1] === 'chat') rest.pop();
-
-  // /<provider>/<reasoning>/chat/completions
-  // provider: اسم مزود واحد (zai, anthropic, openai, google...) أو أسماء متعددة مفصولة بفاصلة كـ fallback
-  //           أو "auto" لو مش عايز تفرض مزود معيّن (AI Gateway هيختار افتراضيًا)
-  // reasoning: none | minimal | low | medium | high | xhigh | max
-  const provider = (rest[0] || 'auto').toLowerCase();
-  const reasoning = (rest[1] || 'none').toLowerCase();
-
   if (req.method === 'GET') {
     return json({
       ok: true,
-      message: 'الـ proxy شغّال. استخدم POST من JanitorAI على نفس هذا المسار مع "/chat/completions".',
-      parsed: { provider, reasoning },
+      message: 'الـ proxy شغّال. استخدم POST من JanitorAI مع خانة Model بصيغة provider/model/reasoning',
     });
   }
 
@@ -63,19 +79,17 @@ export default async function handler(req) {
     return json({ error: { message: 'Invalid JSON body' } }, 400);
   }
 
-  // حقن ترتيب المزود (provider order) في providerOptions.gateway.order
-  if (provider && provider !== 'auto' && provider !== 'any') {
-    body.providerOptions = body.providerOptions || {};
-    body.providerOptions.gateway = body.providerOptions.gateway || {};
-    body.providerOptions.gateway.order = provider
-      .split(',')
-      .map((p) => p.trim())
-      .filter(Boolean);
-  }
+  if (typeof body.model === 'string') {
+    const { model, provider, reasoning } = parseModelField(body.model);
+    body.model = model;
 
-  // حقن reasoning effort لو محدد وصالح
-  if (reasoning && reasoning !== 'none' && reasoning !== 'off') {
-    if (VALID_EFFORTS.has(reasoning)) {
+    if (provider) {
+      body.providerOptions = body.providerOptions || {};
+      body.providerOptions.gateway = body.providerOptions.gateway || {};
+      body.providerOptions.gateway.order = [provider];
+    }
+
+    if (reasoning && reasoning !== 'none' && reasoning !== 'off') {
       body.reasoning = { ...(body.reasoning || {}), effort: reasoning };
     }
   }
