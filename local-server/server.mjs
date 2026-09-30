@@ -14,6 +14,13 @@
 // Termux مختلفة. راجع logger.mjs و view-logs.mjs.
 //
 // تشغيل:  node server.mjs   (أو PORT=5000 node server.mjs)
+//
+// تعديلات هذه النسخة:
+//  1) stream: لو null أو غير موجود يتحول لـ false صريح قبل الإرسال لـ Vercel
+//     (وبيتسجل 0 بدل null).
+//  2) عند فشل fetch يتسجل السبب الحقيقي (e.cause) مش بس "fetch failed".
+//  3) عند نسخ ترويسات الرد بنستبعد content-length و transfer-encoding
+//     (مع content-encoding) عشان الرد المعاد كتابته مايتقطعش.
 
 import http from 'node:http';
 import { logRequest, logCostUpdate, logError } from './logger.mjs';
@@ -31,6 +38,14 @@ const CHAT_COMPLETIONS_PATH = '/chat/completions';
 
 const VALID_EFFORTS = new Set([
   'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max',
+]);
+
+// ترويسات مش بنمررها من رد Vercel للعميل، لأن الرد بيتعاد كتابته
+// (ممكن يتغير حجمه أو ضغطه) فالقيم دي تبقى غلط.
+const SKIPPED_RESPONSE_HEADERS = new Set([
+  'content-encoding',
+  'content-length',
+  'transfer-encoding',
 ]);
 
 function setCors(res) {
@@ -228,7 +243,12 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  const isStream = body.stream === true;
+  // تعديل 1: stream لو null أو undefined أو أي قيمة غير true يبقى false صريح.
+  // stream_options مالهاش لازمة لو مفيش stream، فبنشيلها.
+  body.stream = body.stream === true;
+  if (!body.stream) delete body.stream_options;
+  const isStream = body.stream;
+
   const authHeader = req.headers['authorization'];
   const upstreamHeaders = { 'Content-Type': 'application/json' };
   if (authHeader) upstreamHeaders['Authorization'] = authHeader;
@@ -239,6 +259,7 @@ const server = http.createServer(async (req, res) => {
     messages: Array.isArray(body.messages) ? body.messages : null,
     temperature: body.temperature ?? null,
     max_tokens: body.max_tokens ?? body.max_completion_tokens ?? null,
+    stream: isStream ? 1 : 0,
   };
 
   let upstreamResp;
@@ -249,22 +270,31 @@ const server = http.createServer(async (req, res) => {
       body: JSON.stringify(body),
     });
   } catch (e) {
+    // تعديل 2: نسجل السبب الحقيقي (e.cause) مش بس "fetch failed"
+    const causeText = e.cause
+      ? ` [${e.cause.code || ''} ${e.cause.message || ''}]`.replace(/\s+\]/, ']')
+      : '';
+    const fullMessage = e.message + causeText;
+    console.error('fetch إلى AI Gateway فشل:', fullMessage);
+
     logError({
       provider,
       model: body.model ?? null,
       reasoning_effort: reasoningEffort,
+      stream: isStream ? 1 : 0,
       input: inputSummary,
-      message: e.message,
+      message: fullMessage,
     });
     return sendJson(res, 502, {
-      error: { message: 'تعذّر الوصول لـ AI Gateway: ' + e.message },
+      error: { message: 'تعذّر الوصول لـ AI Gateway: ' + fullMessage },
     });
   }
 
   setCors(res);
   const headersObj = {};
   upstreamResp.headers.forEach((v, k) => {
-    if (k.toLowerCase() === 'content-encoding') return;
+    // تعديل 3: استبعاد الترويسات اللي بتتغير لما نعيد كتابة الرد
+    if (SKIPPED_RESPONSE_HEADERS.has(k.toLowerCase())) return;
     headersObj[k] = v;
   });
 
