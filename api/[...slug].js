@@ -6,6 +6,7 @@ import {
   detectBackendFromApiKey,
   prepareUpstreamRequest,
 } from '../lib/provider-router.mjs';
+import { parseApiKeys, fetchGoogleWithRotation } from '../lib/google-key-pool.mjs';
 
 export const config = { runtime: 'edge' };
 
@@ -33,7 +34,7 @@ export default async function handler(req) {
     return json({
       ok: true,
       message:
-        'الـ proxy شغّال. API key يحدد تلقائيًا: AIza... = Google AI Studio، vck_... = Vercel AI Gateway.',
+        'Proxy is running. vck_ keys use Vercel AI Gateway; other non-empty keys use Google AI Studio. Multiple Google keys may be comma-separated.',
     });
   }
 
@@ -41,7 +42,6 @@ export default async function handler(req) {
     return json({ error: { message: 'Method Not Allowed' } }, 405);
   }
 
-  const authHeader = req.headers.get('authorization');
   const apiKey = getBearerToken(req.headers);
   const backend = detectBackendFromApiKey(apiKey);
 
@@ -49,8 +49,7 @@ export default async function handler(req) {
     return json(
       {
         error: {
-          message:
-            'مفتاح API غير معروف. استخدم مفتاح Google AI Studio الذي يبدأ بـ AIza أو مفتاح Vercel AI Gateway الذي يبدأ بـ vck_.',
+          message: 'Missing or invalid API key.',
           type: 'invalid_api_key_format',
         },
       },
@@ -75,33 +74,72 @@ export default async function handler(req) {
       ? GOOGLE_OPENAI_URL
       : VERCEL_GATEWAY_URL;
 
-  const upstreamHeaders = {
-    'Content-Type': 'application/json',
-    ...(authHeader ? { Authorization: authHeader } : {}),
-  };
-
   let upstreamResp;
+  let errorText = null;
+  let keySlot = null;
+
   try {
-    upstreamResp = await fetch(upstreamUrl, {
-      method: 'POST',
-      headers: upstreamHeaders,
-      body: JSON.stringify(body),
-    });
+    if (backend === PROVIDER_BACKENDS.GOOGLE) {
+      const keys = parseApiKeys(apiKey);
+      const result = await fetchGoogleWithRotation({
+        url: upstreamUrl,
+        body,
+        keys,
+        model: prepared.model,
+      });
+
+      // Defensive guard: a malformed/empty key pool must never turn into a
+      // null dereference and a misleading 502 response.
+      if (!result?.resp) {
+        return json(
+          {
+            error: {
+              message: 'Missing or invalid Google API key.',
+              type: 'invalid_api_key',
+            },
+          },
+          401,
+        );
+      }
+
+      upstreamResp = result.resp;
+      errorText = result.errorText ?? null;
+      keySlot = `${result.keyIndex}/${keys.length}`;
+    } else {
+      upstreamResp = await fetch(upstreamUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(body),
+      });
+    }
   } catch (e) {
     return json(
       {
         error: {
-          message: `تعذّر الوصول إلى ${backend === PROVIDER_BACKENDS.GOOGLE ? 'Google AI Studio' : 'Vercel AI Gateway'}: ${e.message}`,
+          message: `Upstream request failed: ${e.message}`,
         },
       },
       502,
     );
   }
 
-  // نمرّر الرد كما هو، مع CORS.
   const respHeaders = new Headers(upstreamResp.headers);
   const cors = corsHeaders();
-  for (const k in cors) respHeaders.set(k, cors[k]);
+  for (const key in cors) respHeaders.set(key, cors[key]);
+  if (keySlot) respHeaders.set('X-Proxy-Key-Slot', keySlot);
+
+  if (errorText !== null) {
+    for (const header of ['content-encoding', 'content-length', 'transfer-encoding']) {
+      respHeaders.delete(header);
+    }
+    return new Response(errorText, {
+      status: upstreamResp.status,
+      headers: respHeaders,
+    });
+  }
 
   return new Response(upstreamResp.body, {
     status: upstreamResp.status,
