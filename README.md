@@ -1,10 +1,12 @@
-# JanitorAI ↔ Vercel AI Gateway Proxy
+# JanitorAI ↔ Vercel AI Gateway / Google AI Studio Proxy
 
 بروكسي بسيط (Vercel Edge Function واحدة، بدون سيرفر دائم وبدون تخزين أي بيانات) يوصل
-JanitorAI بـ **Vercel AI Gateway**، بحيث:
+JanitorAI بـ **Vercel AI Gateway** أو **Google AI Studio (Gemini API)**، ويختار الخدمة
+تلقائيًا من شكل الـ API key الذي تضعه في JanitorAI، بحيث:
 
-- **المزوّد (Provider)** و**الـ reasoning effort** يتحددوا من خلال خانة **Model** في
-  JanitorAI نفسها، بصيغة: `provider/modelname/reasoningeffort`.
+- مع **Vercel** يتحدد **المزوّد (Provider)** والـ **reasoning effort** من خانة **Model** بصيغة
+  `provider/modelname/reasoningeffort`. مع **Google AI Studio** يكفي اسم موديل Gemini، ويمكن إضافة
+  `/reasoning` في النهاية.
 - **الـ Proxy URL** رابط الـ cloudflare (أو Vercel) الخام **بس، من غير أي إضافة**
   زي `/chat/completions` — المسار ده متعامل معاه جوه السيرفر نفسه (`local-server/server.mjs`)،
   فالبروكسي بيستقبل POST على أي مسار (`/`, `/chat/completions`, `/v1/chat/completions`...)
@@ -15,7 +17,21 @@ JanitorAI بـ **Vercel AI Gateway**، بحيث:
 - نسخة `local-server` بتسجّل كل طلب (مدخلات/مخرجات/تفكير/توكنز/تكلفة) في **لوج محلي
   على جهازك بس** — تفاصيل تحت في قسم [تسجيل الطلبات محليًا (اللوج)](#تسجيل-الطلبات-محليًا-اللوج).
 
-## صيغة خانة Model
+## اختيار Vercel أو Google من الـ API key
+
+لا تحتاج لتغيير Proxy URL عندما تنتقل بين الخدمتين. استخدم فقط مفتاح الخدمة التي تريدها:
+
+| بداية الـ API key | الوجهة | مثال Model |
+|---|---|---|
+| `vck_` | Vercel AI Gateway | `zai/glm-4.6/high` |
+| `AIza` | Google AI Studio | `gemini-3.8-flash/high` |
+
+مفاتيح Vercel AI Gateway الجديدة تستخدم بادئة `vck_`، بينما مفتاح Gemini API من Google AI Studio
+يُستخدم مباشرة مع OpenAI-compatible endpoint الخاص بـ Gemini. Google توثّق أن endpoint هو
+`https://generativelanguage.googleapis.com/v1beta/openai/chat/completions` وأن المصادقة تتم بـ
+`Authorization: Bearer <GEMINI_API_KEY>`. citeturn335181search0turn586504search0
+
+### صيغة خانة Model مع Vercel
 
 ```
 provider/modelname/reasoningeffort   (الجزء الأخير اختياري)
@@ -25,14 +41,34 @@ provider/modelname/reasoningeffort   (الجزء الأخير اختياري)
 |---|---|
 | `zai/glm-4.6` | مزوّد `zai`، موديل `glm-4.6`، بدون reasoning |
 | `zai/glm-4.6/high` | نفس السابق + reasoning effort عالي |
-| `anthropic/claude-sonnet-5/medium` | مزوّد `anthropic`، reasoning متوسط |
-| `groq/openai/gpt-oss-120b` | لو الموديل نفسه فيه `/` (زي عند Groq)، يتحدد صح طالما آخر جزء مش كلمة reasoning معروفة |
-| `groq/openai/gpt-oss-120b/low` | نفس السابق + reasoning منخفض |
 
-**قيم reasoning المدعومة:** `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`
-— القيمة دي بتتبعت كـ `reasoning.effort` لـ Vercel AI Gateway، وهو بيترجمها للصيغة
-المناسبة للموديل (سواء OpenAI أو Anthropic thinking أو غيره). لو الجزء الأخير مش من
-القيم دي، البروكسي هيعتبره جزء من اسم الموديل مش reasoning (زي مثال `groq/openai/gpt-oss-120b`).
+> مع Vercel يُرسل المزوّد كـ `providerOptions.gateway.only` (حصر صارم في هذا المزوّد، بدون fallback).
+| `groq/openai/gpt-oss-120b` | مزوّد `groq`، واسم الموديل نفسه يحتوي `/` |
+
+### صيغة خانة Model مع Google AI Studio
+
+```
+gemini-model/reasoningeffort
+```
+
+البروكسي يقبل أيضًا `google/gemini-model/reasoningeffort`، لكنه يحذف `google/` قبل إرسال الطلب
+إلى Google. لو لم تضع reasoning أصلًا (أو وضعت `none`)، فلا تتم إضافة `reasoning_effort`، وبالتالي يظل إعداد
+التفكير الافتراضي للنموذج هو المستخدم.
+
+تحويل القيم مع Google: `minimal` ← `low`، و`xhigh` و`max` ← `high`، و`low/medium/high` كما هي.
+(`gemini-3.8-flash` لا يدعم `minimal` ولا يمكن إيقاف التفكير فيه.) Google توثّق دعم `reasoning_effort` في OpenAI-compatible
+API لنماذج التفكير. citeturn586504search0
+
+مثال:
+
+```
+gemini-3.8-flash
+gemini-3.8-flash/high
+google/gemini-3.8-flash/high
+```
+
+> ملاحظة: اسم الموديل نفسه يجب أن يكون اسم Gemini المتاح في حسابك/نسخة الـ API التي تستخدمها.
+
 
 ## ما اللي JanitorAI بيبعته وينتظره (عشان تفهم ليه البروكسي مبني كده)
 
@@ -45,8 +81,9 @@ JanitorAI بيتعامل مع أي "Proxy" كأنه سيرفر متوافق مع
 - وبينتظر رد بنفس صيغة OpenAI (`choices[0].message.content`)، أو stream بصيغة SSE لو
   `stream: true`.
 
-البروكسي بيفك خانة `model` لاستخراج المزوّد والـ reasoning، وبيبعت الباقي زي ما هو
-لـ `https://ai-gateway.vercel.sh/v1/chat/completions`.
+البروكسي يحدد الخدمة من الـ API key، ثم يفك خانة `model` ويحوّل reasoning إلى الصيغة المناسبة
+للخدمة. Vercel يستخدم `https://ai-gateway.vercel.sh/v1/chat/completions`، وGoogle يستخدم
+`https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`.
 
 > **ملاحظة عن الـ `/chat/completions`:** JanitorAI هو اللي بيضيفها تلقائيًا على آخر
 > الـ Proxy URL وقت إرسال الطلب. سيرفر `local-server/server.mjs` عندنا مش بيفرّق
@@ -138,10 +175,12 @@ cloudflared tunnel --url http://localhost:5000 &
 | الحقل | القيمة |
 |---|---|
 | Proxy URL | `https://random-words-1234.trycloudflare.com` **فقط** (سيبها من غير أي إضافة — سواء ضغطت "Add /chat/completions" في JanitorAI أو لأ، هتشتغل بنفس الشكل) |
-| API key | مفتاح AI Gateway بتاعك |
-| Model | `zai/glm-4.6/high` (أو أي صيغة `provider/model/reasoning` تانية) |
+| API key | `vck_...` لـ Vercel أو `AIza...` لـ Google AI Studio |
+| Model | مثال Vercel: `zai/glm-4.6/high` — مثال Google: `gemini-3.8-flash/high` |
 
 ## اختبار محلي / يدوي
+
+### Vercel AI Gateway
 
 ```bash
 curl -X POST https://your-project.vercel.app/chat/completions \
@@ -152,6 +191,20 @@ curl -X POST https://your-project.vercel.app/chat/completions \
     "messages": [{"role":"user","content":"قول مرحبا"}]
   }'
 ```
+
+### Google AI Studio
+
+```bash
+curl -X POST https://your-project.vercel.app/chat/completions \
+  -H "Authorization: Bearer $GEMINI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-3.8-flash/high",
+    "messages": [{"role":"user","content":"قول مرحبا"}]
+  }'
+```
+
+في الاختبار الثاني لا تحتاج لتغيير الـ URL؛ البروكسي سيعرف أنه طلب Google من بداية المفتاح.
 
 ## تسجيل الطلبات محليًا (قاعدة البيانات)
 
