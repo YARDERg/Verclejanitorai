@@ -1,6 +1,6 @@
 {
-  "name": "janitorai-vercel-gateway",
-  "version": "1.0.0",
+  "name": "janitorai-vercel-google-proxy",
+  "version": "1.1.0",
   "private": true,
-  "description": "بروكسي يوصل JanitorAI بـ Vercel AI Gateway، مع تحديد المزود والـ reasoning عبر الـ URL"
+  "description": "JanitorAI proxy for Vercel AI Gateway and Google AI Studio, with multi-key Google quota rotation and local SQLite logging."
 }
