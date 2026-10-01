@@ -5,7 +5,7 @@ A small proxy that lets JanitorAI use either:
 - Google AI Studio / Gemini API
 - Vercel AI Gateway
 
-The provider is selected automatically from the API key. Vercel keys starting with `vck_` use Vercel; other non-empty API keys use Google. This fallback is intentional so newer Google key formats are not rejected because they do not use the historical `AIza` prefix.
+The provider is selected automatically from the API key. Vercel keys starting with `vck_` use Vercel; other non-empty API keys use Google. This fallback is intentional so newer Google key formats are not rejected because they do not use the historical `AIza` prefix; new Google `AQ.` authorization keys are also supported.
 
 ## What changed in this version
 
@@ -79,7 +79,7 @@ For `gemini-3.8-flash`, the documented default thinking level is `medium`.
 Put multiple Google keys in JanitorAI's API key field, separated by commas or new lines:
 
 ```text
-AIzaKEY1,AIzaKEY2,AIzaKEY3
+AQ.KEY1,AQ.KEY2,AQ.KEY3
 ```
 
 The proxy tries available keys in their original order. When a key is marked exhausted for a model, it is temporarily skipped. The same model can therefore use a different key on a later request.
