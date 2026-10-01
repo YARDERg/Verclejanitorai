@@ -1,11 +1,13 @@
+import {
+  PROVIDER_BACKENDS,
+  GOOGLE_OPENAI_URL,
+  VERCEL_GATEWAY_URL,
+  getBearerToken,
+  detectBackendFromApiKey,
+  prepareUpstreamRequest,
+} from '../lib/provider-router.mjs';
+
 export const config = { runtime: 'edge' };
-
-const GATEWAY_CHAT_URL = 'https://ai-gateway.vercel.sh/v1/chat/completions';
-
-// قيم reasoning effort المدعومة من Vercel AI Gateway
-const VALID_EFFORTS = new Set([
-  'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max',
-]);
 
 function corsHeaders() {
   return {
@@ -22,41 +24,7 @@ function json(data, status = 200) {
   });
 }
 
-/**
- * يفكّ خانة الـ Model من JanitorAI بصيغة:
- *   provider/modelname            (بدون reasoning)
- *   provider/modelname/reasoning  (مع reasoning)
- *
- * أمثلة:
- *   "zai/glm-4.6/high"          -> model: "zai/glm-4.6",          provider: "zai", reasoning: "high"
- *   "zai/glm-4.6"               -> model: "zai/glm-4.6",          provider: "zai", reasoning: null
- *   "groq/openai/gpt-oss-120b"  -> model: "groq/openai/gpt-oss-120b", provider: "groq", reasoning: null
- *   "glm-4.6"                   -> model: "glm-4.6",              provider: null,  reasoning: null
- */
-function parseModelField(rawModel) {
-  if (typeof rawModel !== 'string' || !rawModel.includes('/')) {
-    return { model: rawModel, provider: null, reasoning: null };
-  }
-
-  const parts = rawModel.split('/');
-  let reasoning = null;
-
-  const last = parts[parts.length - 1].toLowerCase();
-  // نعتبر آخر جزء "reasoning" بس لو كان قيمة معروفة، ولسه فاضل جزءين على الأقل بعد شيله
-  if (parts.length >= 3 && VALID_EFFORTS.has(last)) {
-    reasoning = last;
-    parts.pop();
-  }
-
-  return {
-    model: parts.join('/'),
-    provider: parts[0] || null,
-    reasoning,
-  };
-}
-
 export default async function handler(req) {
-  // دعم preflight الخاص بالمتصفح (JanitorAI بيستدعي من المتصفح مباشرة)
   if (req.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: corsHeaders() });
   }
@@ -64,12 +32,30 @@ export default async function handler(req) {
   if (req.method === 'GET') {
     return json({
       ok: true,
-      message: 'الـ proxy شغّال. استخدم POST من JanitorAI مع خانة Model بصيغة provider/model/reasoning',
+      message:
+        'الـ proxy شغّال. API key يحدد تلقائيًا: AIza... = Google AI Studio، vck_... = Vercel AI Gateway.',
     });
   }
 
   if (req.method !== 'POST') {
     return json({ error: { message: 'Method Not Allowed' } }, 405);
+  }
+
+  const authHeader = req.headers.get('authorization');
+  const apiKey = getBearerToken(req.headers);
+  const backend = detectBackendFromApiKey(apiKey);
+
+  if (!backend) {
+    return json(
+      {
+        error: {
+          message:
+            'مفتاح API غير معروف. استخدم مفتاح Google AI Studio الذي يبدأ بـ AIza أو مفتاح Vercel AI Gateway الذي يبدأ بـ vck_.',
+          type: 'invalid_api_key_format',
+        },
+      },
+      401,
+    );
   }
 
   let body;
@@ -79,38 +65,40 @@ export default async function handler(req) {
     return json({ error: { message: 'Invalid JSON body' } }, 400);
   }
 
-  if (typeof body.model === 'string') {
-    const { model, provider, reasoning } = parseModelField(body.model);
-    body.model = model;
-
-    if (provider) {
-      body.providerOptions = body.providerOptions || {};
-      body.providerOptions.gateway = body.providerOptions.gateway || {};
-      body.providerOptions.gateway.only = [provider];
-    }
-
-    if (reasoning && reasoning !== 'none' && reasoning !== 'off') {
-      body.reasoning = { ...(body.reasoning || {}), effort: reasoning };
-    }
+  if (typeof body.model !== 'string') {
+    return json({ error: { message: 'Missing or invalid model field' } }, 400);
   }
 
-  // نمرّر الـ Authorization اللي JanitorAI بعتها (API key بتاع Vercel AI Gateway) كما هي
-  const authHeader = req.headers.get('authorization');
-  const upstreamHeaders = { 'Content-Type': 'application/json' };
-  if (authHeader) upstreamHeaders['Authorization'] = authHeader;
+  const prepared = prepareUpstreamRequest(body, backend);
+  const upstreamUrl =
+    backend === PROVIDER_BACKENDS.GOOGLE
+      ? GOOGLE_OPENAI_URL
+      : VERCEL_GATEWAY_URL;
+
+  const upstreamHeaders = {
+    'Content-Type': 'application/json',
+    ...(authHeader ? { Authorization: authHeader } : {}),
+  };
 
   let upstreamResp;
   try {
-    upstreamResp = await fetch(GATEWAY_CHAT_URL, {
+    upstreamResp = await fetch(upstreamUrl, {
       method: 'POST',
       headers: upstreamHeaders,
       body: JSON.stringify(body),
     });
   } catch (e) {
-    return json({ error: { message: 'تعذّر الوصول لـ AI Gateway: ' + e.message } }, 502);
+    return json(
+      {
+        error: {
+          message: `تعذّر الوصول إلى ${backend === PROVIDER_BACKENDS.GOOGLE ? 'Google AI Studio' : 'Vercel AI Gateway'}: ${e.message}`,
+        },
+      },
+      502,
+    );
   }
 
-  // تمرير الرد كما هو (سواء JSON عادي أو SSE stream) مع إضافة CORS
+  // نمرّر الرد كما هو، مع CORS.
   const respHeaders = new Headers(upstreamResp.headers);
   const cors = corsHeaders();
   for (const k in cors) respHeaders.set(k, cors[k]);
