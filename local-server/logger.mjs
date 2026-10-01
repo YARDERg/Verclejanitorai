@@ -1,13 +1,6 @@
-// طبقة تسجيل محلية — قاعدة بيانات SQLite حقيقية في ملف واحد بس:
-// local-server/logs.db
-//
-// الملف ده بيتفتح ويضاف عليه في كل مرة تشغّل السيرفر — حتى لو قفلت الجلسة
-// (Termux session) وفتحتها تاني بعد يوم أو أسبوع، هيكمّل يضيف على نفس
-// الملف من غير ما يعمل ملفات جديدة أو يمسح القديم.
-//
-// بيستخدم node:sqlite المدمجة جوه Node نفسه (من غير أي npm install) —
-// متاحة ابتداءً من Node 22.5. لو ظهرلك خطأ إنها مش موجودة، حدّث Node على
-// Termux بـ: pkg install nodejs -y
+// Local SQLite logging layer. The database lives at local-server/logs.db.
+// The same database file is reused across restarts.
+// Requires Node.js 22.5+ for node:sqlite.
 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,20 +13,19 @@ try {
   ({ DatabaseSync } = await import('node:sqlite'));
 } catch (e) {
   console.error(
-    '\n[logger] الموديول node:sqlite مش متاحة في نسخة Node عندك (محتاج Node 22.5+).\n' +
-    'حدّث Node على Termux بـ:  pkg install nodejs -y\n',
+    '\n[logger] node:sqlite is unavailable. Node.js 22.5+ is required.\n' +
+    'Update Node.js with: pkg install nodejs -y\n',
   );
   throw e;
 }
 
 const db = new DatabaseSync(DB_PATH);
-// WAL: يسمح إن view-logs.mjs يقرا من الملف وهو السيرفر لسه شغّال وبيكتب فيه
 db.exec('PRAGMA journal_mode = WAL;');
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS requests (
   id                       INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind                     TEXT NOT NULL DEFAULT 'request', -- 'request' أو 'error'
+  kind                     TEXT NOT NULL DEFAULT 'request', -- 'request' or 'error'
   ts                       TEXT NOT NULL,
   generation_id            TEXT,
   provider                 TEXT,
@@ -105,11 +97,10 @@ function safeRun(stmt, params) {
   try {
     stmt.run(params);
   } catch (e) {
-    console.error('[logger] فشل الكتابة في قاعدة البيانات:', e.message);
+    console.error('[logger] Database write failed:', e.message);
   }
 }
 
-/** يسجّل طلب كامل (مدخلات + مخرجات + تفكير + توكنز) بعد الانتهاء من الرد. */
 export function logRequest(entry) {
   safeRun(insertStmt, {
     kind: 'request',
@@ -137,7 +128,6 @@ export function logRequest(entry) {
   });
 }
 
-/** يسجّل خطأ حصل قبل ما نوصل لرد أصلًا (تعذّر الاتصال بالـ Gateway مثلًا). */
 export function logError(entry) {
   safeRun(insertStmt, {
     kind: 'error',
@@ -165,7 +155,6 @@ export function logError(entry) {
   });
 }
 
-/** يحدّث سطر طلب موجود بالتكلفة الفعلية لما توصل من Vercel (متأخرة شوية). */
 export function logCostUpdate(generationId, cost) {
   if (!generationId) return;
   try {
@@ -183,11 +172,10 @@ export function logCostUpdate(generationId, cost) {
       generation_time_ms: cost.generation_time_ms ?? null,
     });
   } catch (e) {
-    console.error('[logger] فشل تحديث التكلفة:', e.message);
+    console.error('[logger] Cost update failed:', e.message);
   }
 }
 
-/** الاتصال الخام بقاعدة البيانات — تستخدمه view-logs.mjs مباشرة لعمل queries. */
 export function getDb() {
   return db;
 }
