@@ -191,7 +191,7 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, {
       ok: true,
       message:
-        'Proxy is running. Google keys use Google AI Studio; vck_ keys use Vercel AI Gateway. Model syntax depends on the provider.',
+        'Proxy is running. Google AI Studio keys (including new AQ. authorization keys) use Google; vck_ keys use Vercel AI Gateway. Model syntax depends on the provider.',
       chat_endpoint_used_internally: CHAT_COMPLETIONS_PATH,
     });
   }
@@ -216,7 +216,7 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 401, {
       error: {
         message:
-          'Missing or invalid API key. Use a Google AI Studio key or a Vercel AI Gateway key starting with vck_.',
+          'Missing or invalid API key. Use a Google AI Studio key (AQ. or legacy AIza...) or a Vercel AI Gateway key starting with vck_.',
         type: 'invalid_api_key_format',
       },
     });
