@@ -1,47 +1,37 @@
-// نسخة Node.js عادية (بدون أي مكتبات خارجية) من نفس البروكسي،
-// للتشغيل محليًا على Termux/أي جهاز، وعمل tunnel عليها بـ cloudflared.
+// Proxy لـ JanitorAI يدعم تلقائيًا:
+//   AIza...  -> Google AI Studio / Gemini API
+//   vck_...  -> Vercel AI Gateway
 //
-// المزوّد والـ reasoning effort بياخدوا من خانة Model في JanitorAI نفسها،
-// بصيغة: provider/modelname/reasoningeffort (الجزء الأخير اختياري).
+// خانة Model:
+//   Google: gemini-model أو google/gemini-model، مع /reasoning اختياريًا
+//   Vercel: provider/model، مع /reasoning اختياريًا
 //
-// في JanitorAI حط رابط الـ tunnel الخام بس (من غير أي إضافة زي
-// /chat/completions) — البروكسي بيقبل POST على أي مسار (/، /chat/completions،
-// /v1/chat/completions... إلخ) ويتعامل معاه كطلب chat/completions، فمفيش داعي
-// تضيف حاجة يدويًا في خانة الـ Proxy URL.
+// مثال Google:  gemini-3.8-flash/high
+// مثال Vercel:  zai/glm-4.6/high
 //
-// كل طلب بيتسجل محليًا على جهازك في ملف قاعدة بيانات واحد: local-server/logs.db
-// (SQLite) — بيتفتح ويضاف عليه في كل مرة تشغّل السيرفر، حتى لو بعد جلسات
-// Termux مختلفة. راجع logger.mjs و view-logs.mjs.
-//
-// تشغيل:  node server.mjs   (أو PORT=5000 node server.mjs)
-//
-// تعديلات هذه النسخة:
-//  1) stream: لو null أو غير موجود يتحول لـ false صريح قبل الإرسال لـ Vercel
-//     (وبيتسجل 0 بدل null).
-//  2) عند فشل fetch يتسجل السبب الحقيقي (e.cause) مش بس "fetch failed".
-//  3) عند نسخ ترويسات الرد بنستبعد content-length و transfer-encoding
-//     (مع content-encoding) عشان الرد المعاد كتابته مايتقطعش.
+// لا يتم حفظ API key في اللوج.
 
 import http from 'node:http';
 import { logRequest, logCostUpdate, logError } from './logger.mjs';
+import {
+  PROVIDER_BACKENDS,
+  GOOGLE_OPENAI_URL,
+  VERCEL_GATEWAY_URL,
+  getBearerToken,
+  detectBackendFromApiKey,
+  prepareUpstreamRequest,
+} from '../lib/provider-router.mjs';
 
-const GATEWAY_CHAT_URL =
-  process.env.AI_GATEWAY_URL || 'https://ai-gateway.vercel.sh/v1/chat/completions';
 const GATEWAY_GENERATION_URL =
   process.env.AI_GATEWAY_GENERATION_URL || 'https://ai-gateway.vercel.sh/v1/generation';
 const PORT = process.env.PORT || 5000;
 
-// مسار معروف بنستخدمه بس للتوضيح/اللوج — البروكسي فعليًا بيقبل POST على أي
-// مسار تاني برضه (JanitorAI بيبعت لـ <Proxy URL>/chat/completions تلقائيًا
-// لو ضغطت "Add /chat/completions"، وده شغّال برضه حتى لو سبته من غيرها).
+// يمكن تغيير الروابط بمتغيرات البيئة (للاختبار أو لبروكسي وسيط).
+const VERCEL_URL = process.env.AI_GATEWAY_URL || VERCEL_GATEWAY_URL;
+const GOOGLE_URL = process.env.GOOGLE_AI_URL || GOOGLE_OPENAI_URL;
+
 const CHAT_COMPLETIONS_PATH = '/chat/completions';
 
-const VALID_EFFORTS = new Set([
-  'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max',
-]);
-
-// ترويسات مش بنمررها من رد Vercel للعميل، لأن الرد بيتعاد كتابته
-// (ممكن يتغير حجمه أو ضغطه) فالقيم دي تبقى غلط.
 const SKIPPED_RESPONSE_HEADERS = new Set([
   'content-encoding',
   'content-length',
@@ -69,47 +59,16 @@ function readBody(req) {
   });
 }
 
-/**
- * يفكّ خانة الـ Model من JanitorAI بصيغة:
- *   provider/modelname            (بدون reasoning)
- *   provider/modelname/reasoning  (مع reasoning)
- */
-function parseModelField(rawModel) {
-  if (typeof rawModel !== 'string' || !rawModel.includes('/')) {
-    return { model: rawModel, provider: null, reasoning: null };
-  }
-
-  const parts = rawModel.split('/');
-  let reasoning = null;
-
-  const last = parts[parts.length - 1].toLowerCase();
-  if (parts.length >= 3 && VALID_EFFORTS.has(last)) {
-    reasoning = last;
-    parts.pop();
-  }
-
-  return {
-    model: parts.join('/'),
-    provider: parts[0] || null,
-    reasoning,
-  };
-}
-
-/**
- * يحاول يجيب التكلفة الفعلية لطلب معيّن من Vercel AI Gateway.
- * usage events عند Vercel بتتسجل async، فبنستنى وبنعيد المحاولة كذا مرة
- * من غير ما نأخر الرد اللي راح للمستخدم أصلًا (الدالة دي بتتنادى من غير await).
- */
 async function fetchCostInBackground(generationId, authHeader) {
   if (!generationId || !authHeader) return;
 
-  const delaysMs = [3000, 5000, 8000]; // 3 محاولات: بعد 3، 5، 8 ثواني
+  const delaysMs = [3000, 5000, 8000];
   for (const delay of delaysMs) {
     await new Promise((r) => setTimeout(r, delay));
     try {
       const url = `${GATEWAY_GENERATION_URL}?id=${encodeURIComponent(generationId)}`;
       const resp = await fetch(url, { headers: { Authorization: authHeader } });
-      if (resp.status === 404) continue; // لسه مش متسجل عند Vercel، جرّب تاني
+      if (resp.status === 404) continue;
       if (!resp.ok) return;
 
       const data = await resp.json();
@@ -127,17 +86,11 @@ async function fetchCostInBackground(generationId, authHeader) {
       });
       return;
     } catch {
-      // تجاهل وجرّب تاني في اللفة الجاية؛ لو فشلت كل المحاولات، مفيش تكلفة
-      // متسجلة بس باقي بيانات الطلب (input/output/reasoning) اتسجلت عادي.
+      // جرّب المحاولة التالية.
     }
   }
 }
 
-/**
- * يقرأ SSE stream من Vercel، بيبعت كل chunk للعميل زي ما هو لحظيًا (streaming
- * حقيقي)، وفي نفس الوقت بيجمّع الرد النهائي (content + reasoning + usage)
- * عشان يتسجل في اللوج بعد ما الـ stream يخلص.
- */
 async function pipeAndCollectStream(upstreamResp, res) {
   const reader = upstreamResp.body.getReader();
   const decoder = new TextDecoder();
@@ -175,7 +128,7 @@ async function pipeAndCollectStream(upstreamResp, res) {
         if (chunk.choices?.[0]?.finish_reason) finishReason = chunk.choices[0].finish_reason;
         if (chunk.usage) usage = chunk.usage;
       } catch {
-        // سطر SSE مش JSON صالح (نادر) — تجاهله وكمّل
+        // تجاهل أي سطر SSE غير صالح.
       }
     }
   }
@@ -196,8 +149,7 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, {
       ok: true,
       message:
-        'الـ proxy شغّال. حط رابط التونيل الخام في JanitorAI من غير أي إضافة، ' +
-        'واستخدم خانة Model بصيغة provider/model/reasoning',
+        'Proxy شغّال. AIza... = Google AI Studio، vck_... = Vercel AI Gateway. صيغة Model حسب الخدمة.',
       chat_endpoint_used_internally: CHAT_COMPLETIONS_PATH,
     });
   }
@@ -211,7 +163,21 @@ const server = http.createServer(async (req, res) => {
   try {
     pathname = new URL(req.url, `http://${req.headers.host || 'localhost'}`).pathname;
   } catch {
-    // تجاهل، مش مهم للتشغيل
+    // تجاهل.
+  }
+
+  const authHeader = req.headers['authorization'];
+  const apiKey = getBearerToken(req.headers);
+  const backend = detectBackendFromApiKey(apiKey);
+
+  if (!backend) {
+    return sendJson(res, 401, {
+      error: {
+        message:
+          'مفتاح API غير معروف. استخدم مفتاح Google AI Studio الذي يبدأ بـ AIza أو مفتاح Vercel AI Gateway الذي يبدأ بـ vck_.',
+        type: 'invalid_api_key_format',
+      },
+    });
   }
 
   let body;
@@ -222,40 +188,26 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 400, { error: { message: 'Invalid JSON body' } });
   }
 
-  const rawModelField = body.model;
-  let provider = null;
-  let reasoningEffort = null;
-
-  if (typeof body.model === 'string') {
-    const parsedModel = parseModelField(body.model);
-    body.model = parsedModel.model;
-    provider = parsedModel.provider;
-    reasoningEffort = parsedModel.reasoning;
-
-    if (provider) {
-      body.providerOptions = body.providerOptions || {};
-      body.providerOptions.gateway = body.providerOptions.gateway || {};
-      body.providerOptions.gateway.order = [provider];
-    }
-
-    if (reasoningEffort && reasoningEffort !== 'none' && reasoningEffort !== 'off') {
-      body.reasoning = { ...(body.reasoning || {}), effort: reasoningEffort };
-    }
+  if (typeof body.model !== 'string') {
+    return sendJson(res, 400, { error: { message: 'Missing or invalid model field' } });
   }
 
-  // تعديل 1: stream لو null أو undefined أو أي قيمة غير true يبقى false صريح.
-  // stream_options مالهاش لازمة لو مفيش stream، فبنشيلها.
+  const prepared = prepareUpstreamRequest(body, backend);
+
   body.stream = body.stream === true;
   if (!body.stream) delete body.stream_options;
   const isStream = body.stream;
 
-  const authHeader = req.headers['authorization'];
+  const upstreamUrl =
+    backend === PROVIDER_BACKENDS.GOOGLE ? GOOGLE_URL : VERCEL_URL;
+
   const upstreamHeaders = { 'Content-Type': 'application/json' };
-  if (authHeader) upstreamHeaders['Authorization'] = authHeader;
+  if (authHeader) upstreamHeaders.Authorization = authHeader;
 
   const inputSummary = {
     path: pathname,
-    raw_model_field: rawModelField ?? null,
+    backend,
+    raw_model_field: prepared.rawModelField ?? null,
     messages: Array.isArray(body.messages) ? body.messages : null,
     temperature: body.temperature ?? null,
     max_tokens: body.max_tokens ?? body.max_completion_tokens ?? null,
@@ -264,50 +216,54 @@ const server = http.createServer(async (req, res) => {
 
   let upstreamResp;
   try {
-    upstreamResp = await fetch(GATEWAY_CHAT_URL, {
+    upstreamResp = await fetch(upstreamUrl, {
       method: 'POST',
       headers: upstreamHeaders,
       body: JSON.stringify(body),
     });
   } catch (e) {
-    // تعديل 2: نسجل السبب الحقيقي (e.cause) مش بس "fetch failed"
     const causeText = e.cause
       ? ` [${e.cause.code || ''} ${e.cause.message || ''}]`.replace(/\s+\]/, ']')
       : '';
     const fullMessage = e.message + causeText;
-    console.error('fetch إلى AI Gateway فشل:', fullMessage);
+    console.error('Upstream fetch failed:', fullMessage);
 
     logError({
-      provider,
+      provider: prepared.provider,
       model: body.model ?? null,
-      reasoning_effort: reasoningEffort,
+      reasoning_effort: prepared.reasoning,
       stream: isStream ? 1 : 0,
       input: inputSummary,
       message: fullMessage,
     });
+
     return sendJson(res, 502, {
-      error: { message: 'تعذّر الوصول لـ AI Gateway: ' + fullMessage },
+      error: {
+        message:
+          'تعذّر الوصول إلى ' +
+          (backend === PROVIDER_BACKENDS.GOOGLE ? 'Google AI Studio' : 'Vercel AI Gateway') +
+          ': ' +
+          fullMessage,
+      },
     });
   }
 
   setCors(res);
   const headersObj = {};
   upstreamResp.headers.forEach((v, k) => {
-    // تعديل 3: استبعاد الترويسات اللي بتتغير لما نعيد كتابة الرد
     if (SKIPPED_RESPONSE_HEADERS.has(k.toLowerCase())) return;
     headersObj[k] = v;
   });
 
   const baseLogEntry = {
-    provider,
+    provider: prepared.provider,
     model: body.model ?? null,
-    reasoning_effort: reasoningEffort,
+    reasoning_effort: prepared.reasoning,
     stream: isStream,
     status: upstreamResp.status,
     input: inputSummary,
   };
 
-  // لو الرد مش ناجح، سجّل رسالة الخطأ من Vercel كما هي وابعتها للعميل
   if (!upstreamResp.ok) {
     const text = await upstreamResp.text();
     res.writeHead(upstreamResp.status, headersObj);
@@ -333,17 +289,18 @@ const server = http.createServer(async (req, res) => {
     logRequest({
       ...baseLogEntry,
       duration_ms: Date.now() - startedAt,
-      generation_id: generationId,
+      generation_id: backend === PROVIDER_BACKENDS.VERCEL ? generationId : null,
       output: { content: content || null, finish_reason: finishReason },
       reasoning: { text: reasoning || null },
       usage,
     });
 
-    if (generationId) void fetchCostInBackground(generationId, authHeader);
+    if (backend === PROVIDER_BACKENDS.VERCEL && generationId) {
+      void fetchCostInBackground(generationId, authHeader);
+    }
     return;
   }
 
-  // رد عادي (غير stream): نقرأه كامل عشان نبعته للعميل ونسجّله في نفس الوقت
   const text = await upstreamResp.text();
   res.writeHead(upstreamResp.status, headersObj);
   res.end(text);
@@ -352,11 +309,12 @@ const server = http.createServer(async (req, res) => {
   try {
     parsed = JSON.parse(text);
   } catch {
-    // الرد مش JSON لسبب ما — هنسجل النص الخام بس
+    // الرد مش JSON — سجّل النص الخام.
   }
 
   const message = parsed?.choices?.[0]?.message;
-  const generationId = parsed?.id ?? null;
+  const generationId =
+    backend === PROVIDER_BACKENDS.VERCEL ? (parsed?.id ?? null) : null;
 
   logRequest({
     ...baseLogEntry,
@@ -367,18 +325,25 @@ const server = http.createServer(async (req, res) => {
       finish_reason: parsed?.choices?.[0]?.finish_reason ?? null,
     },
     reasoning: {
-      text: message?.reasoning ?? message?.reasoning_content ?? null,
+      text:
+        message?.reasoning ??
+        message?.reasoning_content ??
+        message?.thinking ??
+        null,
     },
     usage: parsed?.usage ?? null,
   });
 
-  if (generationId) void fetchCostInBackground(generationId, authHeader);
+  if (backend === PROVIDER_BACKENDS.VERCEL && generationId) {
+    void fetchCostInBackground(generationId, authHeader);
+  }
 });
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Proxy شغّال على http://0.0.0.0:${PORT}`);
   console.log('استخدم: cloudflared tunnel --url http://localhost:' + PORT);
-  console.log('في JanitorAI حط رابط التونيل الخام بس (من غير /chat/completions).');
-  console.log('Model = provider/modelname/reasoningeffort  (مثال: zai/glm-4.6/high)');
+  console.log('API key: AIza... -> Google AI Studio | vck_... -> Vercel AI Gateway');
+  console.log('Google Model = gemini-model/reasoning (مثال: gemini-3.8-flash/high)');
+  console.log('Vercel Model = provider/model/reasoning (مثال: zai/glm-4.6/high)');
   console.log('كل طلب بيتسجل في: local-server/logs.db — شوفه بـ: node view-logs.mjs');
 });
