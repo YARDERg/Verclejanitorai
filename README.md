@@ -1,267 +1,289 @@
-# JanitorAI ↔ Vercel AI Gateway / Google AI Studio Proxy
+# JanitorAI Proxy for Vercel AI Gateway and Google AI Studio
 
-بروكسي بسيط (Vercel Edge Function واحدة، بدون سيرفر دائم وبدون تخزين أي بيانات) يوصل
-JanitorAI بـ **Vercel AI Gateway** أو **Google AI Studio (Gemini API)**، ويختار الخدمة
-تلقائيًا من شكل الـ API key الذي تضعه في JanitorAI، بحيث:
+A small proxy that lets JanitorAI use either:
 
-- مع **Vercel** يتحدد **المزوّد (Provider)** والـ **reasoning effort** من خانة **Model** بصيغة
-  `provider/modelname/reasoningeffort`. مع **Google AI Studio** يكفي اسم موديل Gemini، ويمكن إضافة
-  `/reasoning` في النهاية.
-- **الـ Proxy URL** رابط الـ cloudflare (أو Vercel) الخام **بس، من غير أي إضافة**
-  زي `/chat/completions` — المسار ده متعامل معاه جوه السيرفر نفسه (`local-server/server.mjs`)،
-  فالبروكسي بيستقبل POST على أي مسار (`/`, `/chat/completions`, `/v1/chat/completions`...)
-  ويتعامل معاه كنفس الطلب. يعني تقدر تسيب زرار "Add /chat/completions" في JanitorAI
-  مفعّل أو لأ، النتيجة واحدة.
-- الـ **API key** بتاع Vercel AI Gateway بيتبعت من JanitorAI في خانة "API key" ويتمرر
-  مباشرة في هيدر `Authorization` — البروكسي مايخزنش ولا يشوف المفتاح، بس بيمرره.
-- نسخة `local-server` بتسجّل كل طلب (مدخلات/مخرجات/تفكير/توكنز/تكلفة) في **لوج محلي
-  على جهازك بس** — تفاصيل تحت في قسم [تسجيل الطلبات محليًا (اللوج)](#تسجيل-الطلبات-محليًا-اللوج).
+- Google AI Studio / Gemini API
+- Vercel AI Gateway
 
-## اختيار Vercel أو Google من الـ API key
+The provider is selected automatically from the API key. Vercel keys starting with `vck_` use Vercel; other non-empty API keys use Google. This fallback is intentional so newer Google key formats are not rejected because they do not use the historical `AIza` prefix.
 
-لا تحتاج لتغيير Proxy URL عندما تنتقل بين الخدمتين. استخدم فقط مفتاح الخدمة التي تريدها:
+## What changed in this version
 
-| بداية الـ API key | الوجهة | مثال Model |
-|---|---|---|
-| `vck_` | Vercel AI Gateway | `zai/glm-4.6/high` |
-| `AIza` | Google AI Studio | `gemini-3.8-flash/high` |
+### Google error handling
 
-مفاتيح Vercel AI Gateway الجديدة تستخدم بادئة `vck_`، بينما مفتاح Gemini API من Google AI Studio
-يُستخدم مباشرة مع OpenAI-compatible endpoint الخاص بـ Gemini. Google توثّق أن endpoint هو
-`https://generativelanguage.googleapis.com/v1beta/openai/chat/completions` وأن المصادقة تتم بـ
-`Authorization: Bearer <GEMINI_API_KEY>`. citeturn335181search0turn586504search0
+The Google key pool now follows Google's documented error categories more carefully:
 
-### صيغة خانة Model مع Vercel
+- `401` authentication failures: rotate to the next Google key and temporarily quarantine the failing key.
+- `403` permission/access failures: do **not** rotate. A 403 can indicate project permissions, region/access restrictions, or other account-level conditions, so switching keys is not a safe assumption.
+- `429 RESOURCE_EXHAUSTED`: rotate to another Google key when available. Daily quota exhaustion is held until the next midnight Pacific reset; other rate limits use Google's `retryDelay` when present.
+- Other client/server errors are passed through instead of being incorrectly treated as key failures.
 
-```
-provider/modelname/reasoningeffort   (الجزء الأخير اختياري)
-```
+Google documents 401 as an authentication problem, 403 as a permission problem, and 429 as rate-limit/quota exhaustion. Google also recommends exponential backoff for transient retryable errors. See the official Gemini API error and troubleshooting documentation.
 
-| ما تكتبه في Model | المعنى |
-|---|---|
-| `zai/glm-4.6` | مزوّد `zai`، موديل `glm-4.6`، بدون reasoning |
-| `zai/glm-4.6/high` | نفس السابق + reasoning effort عالي |
+### Important quota detail
 
-> مع Vercel يُرسل المزوّد كـ `providerOptions.gateway.only` (حصر صارم في هذا المزوّد، بدون fallback).
-| `groq/openai/gpt-oss-120b` | مزوّد `groq`، واسم الموديل نفسه يحتوي `/` |
+Gemini rate limits are applied **per Google Cloud project, not per API key**. Therefore, three keys from the same project do not provide three independent daily quotas. Rotation is useful when your keys belong to projects with independent quota.
 
-### صيغة خانة Model مع Google AI Studio
+Daily requests-per-day quotas reset at midnight Pacific Time according to Google's current rate-limit documentation.
 
-```
-gemini-model/reasoningeffort
+### English-only interface
+
+All built-in UI messages, CLI output, comments, and documentation are now English and left-to-right friendly.
+
+The SQLite schema was already English, so no schema migration is required. Existing `logs.db` files remain compatible. User-generated request/response text stored inside the database is not rewritten, because that is data rather than application UI.
+
+## Google AI Studio / Gemini API
+
+The proxy uses Google's OpenAI-compatible endpoint:
+
+```text
+https://generativelanguage.googleapis.com/v1beta/openai/chat/completions
 ```
 
-البروكسي يقبل أيضًا `google/gemini-model/reasoningeffort`، لكنه يحذف `google/` قبل إرسال الطلب
-إلى Google. لو لم تضع reasoning أصلًا (أو وضعت `none`)، فلا تتم إضافة `reasoning_effort`، وبالتالي يظل إعداد
-التفكير الافتراضي للنموذج هو المستخدم.
+Google's OpenAI compatibility documentation currently shows this base endpoint and Bearer API-key authentication through the OpenAI-compatible client.
 
-تحويل القيم مع Google: `minimal` ← `low`، و`xhigh` و`max` ← `high`، و`low/medium/high` كما هي.
-(`gemini-3.8-flash` لا يدعم `minimal` ولا يمكن إيقاف التفكير فيه.) Google توثّق دعم `reasoning_effort` في OpenAI-compatible
-API لنماذج التفكير. citeturn586504search0
+### Model syntax
 
-مثال:
-
+```text
+gemini-model
+ gemini-model/reasoning
+ google/gemini-model/reasoning
 ```
+
+Examples:
+
+```text
 gemini-3.8-flash
 gemini-3.8-flash/high
 google/gemini-3.8-flash/high
 ```
 
-> ملاحظة: اسم الموديل نفسه يجب أن يكون اسم Gemini المتاح في حسابك/نسخة الـ API التي تستخدمها.
+The current Gemini 3.8 Flash documentation lists `gemini-3.8-flash` as a stable model and supports thinking levels `low`, `medium`, and `high`. `minimal` is not supported by that model. Gemini 3 models cannot disable thinking entirely.
 
+The proxy maps JanitorAI/OpenAI-style reasoning values as follows:
 
-## ما اللي JanitorAI بيبعته وينتظره (عشان تفهم ليه البروكسي مبني كده)
+| Input | Google value |
+|---|---|
+| `minimal` | `low` |
+| `low` | `low` |
+| `medium` | `medium` |
+| `high` | `high` |
+| `xhigh` | `high` |
+| `max` | `high` |
+| `none` or omitted | Do not send `reasoning_effort`; keep the model default |
 
-JanitorAI بيتعامل مع أي "Proxy" كأنه سيرفر متوافق مع OpenAI:
+For `gemini-3.8-flash`, the documented default thinking level is `medium`.
 
-- بيعمل `POST` على: `<Proxy URL اللي كتبته>/chat/completions`
-- بيبعت هيدر: `Authorization: Bearer <API key>`
-- بيبعت body بصيغة OpenAI القياسية، فيها `model` بالنص اللي كتبته بالظبط، و`messages`
-  (array بأدوار system/user/assistant)، و`stream`, `temperature`, إلخ.
-- وبينتظر رد بنفس صيغة OpenAI (`choices[0].message.content`)، أو stream بصيغة SSE لو
-  `stream: true`.
+## Multiple Google keys
 
-البروكسي يحدد الخدمة من الـ API key، ثم يفك خانة `model` ويحوّل reasoning إلى الصيغة المناسبة
-للخدمة. Vercel يستخدم `https://ai-gateway.vercel.sh/v1/chat/completions`، وGoogle يستخدم
-`https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`.
+Put multiple Google keys in JanitorAI's API key field, separated by commas or new lines:
 
-> **ملاحظة عن الـ `/chat/completions`:** JanitorAI هو اللي بيضيفها تلقائيًا على آخر
-> الـ Proxy URL وقت إرسال الطلب. سيرفر `local-server/server.mjs` عندنا مش بيفرّق
-> أصلًا بين المسارات — أي POST بيوصله (سواء على `/` أو `/chat/completions` أو أي
-> حاجة تانية) بيتعامل معاه كطلب chat/completions. يعني حتى لو JanitorAI مستقبلًا
-> بعت المسار بصيغة مختلفة، البروكسي لسه هيشتغل من غير أي تعديل.
+```text
+AIzaKEY1,AIzaKEY2,AIzaKEY3
+```
 
-> **ملاحظة:** بالرجوع لسورس [GeminiForJanitors](https://github.com/vu5eruz/GeminiForJanitors)
-> الأصلي، هو كمان بيحدد المزوّد جوه خانة Model بصيغة `provider/model` (زي OpenRouter)،
-> فالتصميم ده قريب من نفس الفكرة، بس بإضافة جزء ثالث اختياري للـ reasoning.
+The proxy tries available keys in their original order. When a key is marked exhausted for a model, it is temporarily skipped. The same model can therefore use a different key on a later request.
 
-## النشر على Vercel
+The proxy never stores the actual API keys in SQLite. It only exposes a diagnostic response header such as:
 
-1. ثبّت Vercel CLI:
-   ```bash
-   npm i -g vercel
-   ```
-2. من داخل مجلد المشروع:
-   ```bash
-   vercel deploy --prod
-   ```
-   أو ارفع المشروع على GitHub واربطه من [vercel.com/new](https://vercel.com/new).
+```text
+X-Proxy-Key-Slot: 2/3
+```
 
-مفيش أي Environment Variables مطلوبة — البروكسي stateless بالكامل.
+This header identifies the key position, not the key itself.
 
-## تشغيله محليًا على Termux (Android) + cloudflared — بديل مجاني عن Vercel
+### Why a key can still fail after rotation
 
-الملف الجاهز لده في `local-server/server.mjs` (نفس منطق `api/[...slug].js` بالظبط،
-بصيغة سيرفر Node عادي بدون أي مكتبات خارجية، وبيسجّل كل طلب في قاعدة بيانات SQLite
-محلية — راجع [تسجيل الطلبات محليًا](#تسجيل-الطلبات-محليًا-قاعدة-البيانات) تحت).
+If all keys belong to the same Google Cloud project, they share that project's Gemini quota. Rotation cannot create additional quota in that situation. This is a Google-side quota rule, not a proxy limitation.
 
-> يحتاج Node **22.5 أو أحدث** عشان `node:sqlite` (لتسجيل الطلبات) تكون متاحة.
-> `pkg install nodejs` على Termux بيجيب أحدث نسخة عادةً، فمفروض تكون متاحة.
+Also, a `403` is intentionally not rotated because it is not necessarily a bad API key. Google documents permission and access restrictions as possible causes.
 
-### 1) تثبيت Node.js و cloudflared و git
+## Vercel AI Gateway
+
+Vercel requests use:
+
+```text
+https://ai-gateway.vercel.sh/v1/chat/completions
+```
+
+### Model syntax
+
+```text
+provider/model
+provider/model/reasoning
+```
+
+Examples:
+
+```text
+zai/glm-4.6
+zai/glm-4.6/high
+groq/openai/gpt-oss-120b
+```
+
+The first path component is treated as the selected Vercel provider. The remaining model path is sent as the model name, and the provider is placed in `providerOptions.gateway.only`.
+
+## JanitorAI configuration
+
+| Field | Value |
+|---|---|
+| Proxy URL | Your deployed proxy URL only |
+| API key | Google key(s), or a Vercel `vck_...` key |
+| Model for Google | `gemini-3.8-flash/high` |
+| Model for Vercel | `zai/glm-4.6/high` |
+
+JanitorAI can append `/chat/completions` to the proxy URL. The local server also accepts the normal HTTP request regardless of the exact incoming path.
+
+## Deploy to Vercel
+
+1. Install the Vercel CLI:
+
+```bash
+npm i -g vercel
+```
+
+2. From the project directory:
+
+```bash
+vercel deploy --prod
+```
+
+Or connect the repository to Vercel and deploy it from the Vercel dashboard.
+
+No environment variables are required for the standard Vercel deployment.
+
+## Run locally on Termux
+
+The local server is a plain Node.js HTTP server and does not require npm dependencies.
+
+Node.js **22.5+** is required because the logger uses the built-in `node:sqlite` module.
+
+### Install prerequisites
 
 ```bash
 pkg update
 pkg install -y nodejs cloudflared git
 ```
 
-### 2) نسخ المشروع (لو الـ repo خاص/private)
-
-لو الـ repo عندك private، لازم Personal Access Token بدل الباسورد العادي:
-
-1. من GitHub: صورتك (فوق يمين) → **Settings** → **Developer settings**
-2. **Personal access tokens** → **Tokens (classic)** → **Generate new token (classic)**
-3. حدد صلاحية **repo** فقط، ثم **Generate token** وانسخه فورًا
+### Start the server
 
 ```bash
-git clone https://github.com/<username>/<repo>.git
-```
-
-هيطلب `Username` (اسم حسابك) و`Password` (الصق التوكن هنا، مش الباسورد الحقيقي).
-
-### 3) تشغيل السيرفر
-
-```bash
-cd <repo>/local-server
+cd local-server
 node server.mjs
 ```
 
-هيشتغل افتراضيًا على `http://localhost:5000` (تقدر تغيّر البورت بـ `PORT=8080 node server.mjs`).
+Default address:
 
-### 4) عمل tunnel في جلسة Termux تانية (أو بنفس الجلسة في الخلفية)
+```text
+http://localhost:5000
+```
+
+You can change the port:
+
+```bash
+PORT=8080 node server.mjs
+```
+
+### Expose it with Cloudflare Tunnel
+
+In another Termux session:
 
 ```bash
 cloudflared tunnel --url http://localhost:5000
 ```
 
-هيديك رابط زي:
-```
-https://random-words-1234.trycloudflare.com
+Use the generated HTTPS URL as the JanitorAI Proxy URL.
+
+## Local SQLite logging
+
+Only the local-server version stores request logs. The database file is:
+
+```text
+local-server/logs.db
 ```
 
-> ملاحظة: رابط `trycloudflare.com` المجاني بيتغيّر كل مرة تشغّل cloudflared، فلازم
-> تحدّث الـ Proxy URL في JanitorAI كل مرة.
+The same database file is reused after restarts. WAL mode allows the log viewer to read the database while the server is running.
 
-### التشغيل في الخلفية على Termux (اختياري)
+The schema contains English column names, including:
+
+- request timestamp and duration
+- provider and model
+- original model field
+- reasoning effort
+- input messages
+- output content
+- finish reason
+- reasoning text when available
+- token usage
+- Vercel generation ID
+- delayed Vercel cost information
+- error messages
+
+API keys are not stored in the database.
+
+### Existing database handling
+
+If `local-server/logs.db` already exists, the server uses it and keeps the existing rows. The current schema uses English column names, so no Arabic-to-English database migration is necessary.
+
+Arabic or other language text inside `input_messages`, `output_content`, or other user-generated fields is preserved exactly as data. Only application UI/documentation was translated to English.
+
+### View logs
 
 ```bash
-termux-wake-lock
-node server.mjs &
-cloudflared tunnel --url http://localhost:5000 &
+node view-logs.mjs
+node view-logs.mjs --last 50
+node view-logs.mjs 2026-09-25
+node view-logs.mjs --all
+node view-logs.mjs --stats
+node view-logs.mjs --full <id-or-generation-id>
 ```
 
-## الإعداد في JanitorAI
-
-| الحقل | القيمة |
-|---|---|
-| Proxy URL | `https://random-words-1234.trycloudflare.com` **فقط** (سيبها من غير أي إضافة — سواء ضغطت "Add /chat/completions" في JanitorAI أو لأ، هتشتغل بنفس الشكل) |
-| API key | `vck_...` لـ Vercel أو `AIza...` لـ Google AI Studio |
-| Model | مثال Vercel: `zai/glm-4.6/high` — مثال Google: `gemini-3.8-flash/high` |
-
-## اختبار محلي / يدوي
-
-### Vercel AI Gateway
-
-```bash
-curl -X POST https://your-project.vercel.app/chat/completions \
-  -H "Authorization: Bearer $AI_GATEWAY_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "zai/glm-4.6/high",
-    "messages": [{"role":"user","content":"قول مرحبا"}]
-  }'
-```
-
-### Google AI Studio
-
-```bash
-curl -X POST https://your-project.vercel.app/chat/completions \
-  -H "Authorization: Bearer $GEMINI_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gemini-3.8-flash/high",
-    "messages": [{"role":"user","content":"قول مرحبا"}]
-  }'
-```
-
-في الاختبار الثاني لا تحتاج لتغيير الـ URL؛ البروكسي سيعرف أنه طلب Google من بداية المفتاح.
-
-## تسجيل الطلبات محليًا (قاعدة البيانات)
-
-نسخة `local-server` بس (مش نسخة Vercel، لأن دي stateless ومفيهاش تخزين دائم) بتسجّل
-كل طلب في **قاعدة بيانات SQLite حقيقية، ملف واحد بس**: `local-server/logs.db`.
-
-مبني على `node:sqlite` **المدمجة جوه Node نفسه** (متاحة من Node 22.5+) — يعني مفيش
-أي `npm install`. الملف ده بيتفتح ويضاف عليه في كل مرة تشغّل `node server.mjs`،
-حتى لو قفلت جلسة Termux وفتحتها تاني بعد يوم أو أسبوع — البيانات بتفضل موجودة
-وبيكمّل يضيف عليها من غير ما يعمل ملفات جديدة أو يصفّرها.
-
-فيه جدول واحد اسمه `requests`، وكل سطر فيه:
-
-- التاريخ والوقت (`ts`)، ومدة الطلب (`duration_ms`)
-- `provider`، `model`، `reasoning_effort` (المستخرجين من خانة Model)
-- `input_messages` (كل الرسايل اللي اتبعتت — النص الكامل، JSON)
-- `output_content` (رد الموديل الكامل) و`finish_reason`
-- `reasoning_text` (نص التفكير الكامل لو الموديل بعت reasoning)
-- توكنز الإدخال/الإخراج/التفكير (`usage_prompt_tokens`... إلخ)
-- `generation_id` بتاع Vercel، وعمود `total_cost` (وتفاصيل التكلفة الفرعية)
-
-**التكلفة (`total_cost`)** بتوصل متأخرة شوية (ثواني معدودة) لأن Vercel بتسجل الـ
-usage events بشكل غير متزامن، فالبروكسي بيحاول يجيبها في الخلفية (من غير ما يأخر
-الرد اللي راجع لـ JanitorAI) وبيعمل `UPDATE` على نفس السطر لما توصل.
-
-**مهم:** الـ **API key** بتاعك **مابيتسجلش خالص** في قاعدة البيانات — بس بيتمرر في
-الهيدر ولا بيتحفظ في أي مكان.
-
-### عرض قاعدة البيانات
-
-من جوه `local-server/`:
-
-```bash
-node view-logs.mjs                 # آخر 20 طلب (بغض النظر عن التاريخ)
-node view-logs.mjs --last 50       # آخر 50 طلب
-node view-logs.mjs 2026-09-20      # كل طلبات يوم معيّن
-node view-logs.mjs --all           # كل التواريخ اللي فيها طلبات
-node view-logs.mjs --stats         # إجمالي التوكنز والتكلفة على كل الفترة
-node view-logs.mjs --full <id>     # التفاصيل الكاملة (input/output/reasoning) لطلب واحد — الـ id رقم السطر أو generation_id بتاع Vercel
-```
-
-أو لو عايز تستعلم بنفسك بـ SQL مباشرة (بعد تثبيت أداة `sqlite3` أو أي برنامج زي
-DB Browser for SQLite):
+### Direct SQLite query
 
 ```bash
 sqlite3 local-server/logs.db "SELECT ts, model, total_cost FROM requests ORDER BY id DESC LIMIT 5;"
 ```
 
-لو عايز تصفّر السجل كله، امسح `local-server/logs.db` (وملفات `logs.db-wal` /
-`logs.db-shm` المرافقة له لو موجودة) — هيتعمل من جديد أول ما تشغّل السيرفر تاني.
+Delete `local-server/logs.db` if you intentionally want to start a new empty log database.
 
-> **خصوصية:** `local-server/logs.db` مضاف في `.gitignore`، يعني لو الـ repo بتاعك
-> على GitHub (حتى لو private) مش هيترفع فيه، وهيفضل على جهازك بس.
+## Manual tests
 
-## ملاحظات
+### Google
 
-- CORS مفتوح للجميع (`Access-Control-Allow-Origin: *`) لأن JanitorAI بيستدعي البروكسي
-  مباشرة من متصفح المستخدم.
-- الـ streaming (`stream: true`) بيتمرر لحظيًا للعميل زي ما هو (pass-through حقيقي)،
-  وفي نفس الوقت بيتجمّع في الخلفية عشان يتسجل في قاعدة البيانات بعد ما يخلص.
+```bash
+curl -X POST https://YOUR-PROXY.example/chat/completions \
+  -H "Authorization: Bearer $GEMINI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-3.8-flash/high",
+    "messages": [{"role":"user","content":"Say hello."}]
+  }'
+```
+
+### Vercel
+
+```bash
+curl -X POST https://YOUR-PROXY.example/chat/completions \
+  -H "Authorization: Bearer $AI_GATEWAY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "zai/glm-4.6/high",
+    "messages": [{"role":"user","content":"Say hello."}]
+  }'
+```
+
+## Security notes
+
+- API keys are forwarded to the selected upstream service and are not written to the SQLite database.
+- The diagnostic key-slot header never contains the actual key.
+- Restrict Google API keys to the Gemini API as recommended by Google's current API-key documentation.
+- Keep `logs.db` private because it can contain complete prompts and model responses.
+
+## Official references
+
+- Google Gemini OpenAI compatibility: https://ai.google.dev/gemini-api/docs/openai
+- Google Gemini API errors: https://ai.google.dev/gemini-api/docs/api-errors
+- Google Gemini troubleshooting: https://ai.google.dev/gemini-api/docs/troubleshooting
+- Google Gemini rate limits: https://ai.google.dev/gemini-api/docs/rate-limits
+- Google Gemini API keys: https://ai.google.dev/gemini-api/docs/api-key
+- Google Gemini models: https://ai.google.dev/gemini-api/docs/models
